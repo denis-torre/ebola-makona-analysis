@@ -1,0 +1,6 @@
+ebola-makona-analysis.sublime-project
+ebola-makona-analysis.sublime-workspace
+*.sqlite
+*-checkpoint.ipynb
+*.pyc
+*.dir
