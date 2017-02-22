@@ -14,6 +14,7 @@
 from ruffus import *
 import sys, os, gzip, glob
 import pandas as pd
+import numpy as np
 import rpy2.robjects as robjects
 import pandas.rpy.common as com
 
@@ -28,9 +29,18 @@ import PipelineEbolaMakonaAnalysis as P
 ########## 2. General Setup
 #############################################
 ##### 1. Variables #####
+### 1. Scripts
 kallistoPath = '/Users/denis/Documents/Projects/scripts/tools/kallisto/kallisto'
+fastqcPath = '/Applications/FastQC.app/Contents/MacOS/fastqc'
+
+### 2. Files
+macacaTranscriptomeFastq = 'rawdata.dir/transcriptome/Macaca_mulatta.Mmul_8.0.1.cdna.all.fa.gz'
+sequencingFastq = 'rawdata.dir/fastq/*.fastq.gz'
+sampleAnnotationFile = 'rawdata.dir/annotations/Animal_IDs_PBMC_Makona_.txt'
+sampleClinicalDataFile = 'rawdata.dir/annotations/ZEBOV_makona_clinicalparameters.xls'
 
 ##### 2. R Connection #####
+# Local source
 rSource = 'pipeline/scripts/pipeline-ebola-makona-analysis.R'
 r = robjects.r
 r.source(rSource)
@@ -47,7 +57,7 @@ r.source(rSource)
 
 @follows(mkdir('f1-transcriptome.dir'))
 
-@transform('rawdata.dir/transcriptome/Macaca_mulatta.Mmul_8.0.1.cdna.all.fa.gz',
+@transform(macacaTranscriptomeFastq,
 		   regex(r'.*/(.*).fa.gz'),
 		   r'f1-transcriptome.dir/\1.idx')
 
@@ -63,7 +73,7 @@ def buildTranscriptomeIndex(infile, outfile):
 ########## 2. Create annotations
 #############################################
 
-@transform('rawdata.dir/transcriptome/Macaca_mulatta.Mmul_8.0.1.cdna.all.fa.gz',
+@transform(macacaTranscriptomeFastq,
 		   regex(r'.*/(.*).fa.gz'),
 		   r'f1-transcriptome.dir/\1_annotation.txt')
 
@@ -86,11 +96,39 @@ def makeTranscriptomeAnnotationTable(infile, outfile):
 	transcriptAnnotationDataframe = pd.DataFrame(transcriptDataDict).loc[selectedRows].T
 
 	# Write file
-	transcriptAnnotationDataframe.to_csv(outfile, sep='\t', index_label='transcript')
+	transcriptAnnotationDataframe.to_csv(outfile, sep='\t', index_label='ensembl_transcript_id')
 
 #######################################################
 #######################################################
-########## S2. Read quantification
+########## S2. Read Quality Control
+#######################################################
+#######################################################
+
+#############################################
+########## 1. FastQC
+#############################################
+
+@follows(mkdir('f2-qc.dir'))
+
+@transform(sequencingFastq,
+		   regex(r'.*/(.*).fastq.gz'),
+		   r'f2-qc.dir/\1_fastqc.html')
+
+def runFastQC(infile, outfile):
+
+	# Get FastQC output files
+	outputHtmlFile = infile.replace('.fastq.gz', '_fastqc.html')
+	outputZipFile = infile.replace('.fastq.gz', '_fastqc.zip')
+
+	# Prepare statement
+	statement = fastqcPath + ' %(infile)s; mv %(outputHtmlFile)s %(outfile)s; rm %(outputZipFile)s;' % locals()
+
+	# Run statement
+	os.system(statement)
+
+#######################################################
+#######################################################
+########## S3. Read quantification
 #######################################################
 #######################################################
 
@@ -98,12 +136,12 @@ def makeTranscriptomeAnnotationTable(infile, outfile):
 ########## 1. Quantification
 #############################################
 
-@follows(mkdir('f2-expression_quantification.dir'))
+@follows(mkdir('f3-expression_quantification.dir'))
 
-@transform('rawdata.dir/fastq/*',
+@transform(sequencingFastq,
 		   regex(r'.*/(.*).fastq.gz'),
 		   add_inputs(buildTranscriptomeIndex),
-		   r'f2-expression_quantification.dir/\1')
+		   r'f3-expression_quantification.dir/\1')
 
 def quantifyExpressionData(infiles, outfile):
 
@@ -111,14 +149,14 @@ def quantifyExpressionData(infiles, outfile):
 	fastqFile, transcriptomeFile = infiles
 
 	# Prepare statement
-	statement = kallistoPath + ' quant -i %(transcriptomeFile)s -o %(outfile)s -b 100 --single -l 180 -s 20 %(fastqFile)s' % locals() #############
+	statement = kallistoPath + ' quant -i %(transcriptomeFile)s -o %(outfile)s -b 100 --single -l 100 -s 20 %(fastqFile)s' % locals()
 
 	# Run
 	os.system(statement)
 
 #######################################################
 #######################################################
-########## S3. Data processing
+########## S4. Annotation Data
 #######################################################
 #######################################################
 
@@ -126,10 +164,11 @@ def quantifyExpressionData(infiles, outfile):
 ########## 1. Sample annotations
 #############################################
 
-@follows(mkdir('f3-processed_data.dir'))
+@follows(mkdir('f4-annotation_data.dir'))
 
-@files(['rawdata.dir/annotations/Animal_IDs_PBMC_Makona_.txt', 'rawdata.dir/annotations/ZEBOV_makona_clinicalparameters.xls'],
-	   'f3-processed_data.dir/ebola_pbmc-sample_annotations.txt')
+@files([sampleAnnotationFile,
+		sampleClinicalDataFile],
+	   'f4-annotation_data.dir/ebola_pbmc-sample_annotations.txt')
 
 def makeSampleAnnotationTable(infiles, outfile):
 
@@ -140,7 +179,10 @@ def makeSampleAnnotationTable(infiles, outfile):
 	sampleDataframe = pd.read_table(sampleInfile)
 
 	# Read clinical table
-	clinicalDataframe = pd.read_excel(clinicalInfile)
+	clinicalDataframe = pd.read_excel(clinicalInfile).dropna()
+
+	# Fix Animal ID
+	clinicalDataframe['Animal ID'] = [int(x) for x in clinicalDataframe['Animal ID']]
 
 	# Add sample column
 	sampleDataframe['FASTQ_name'] = [x.split('.')[0] for x in sampleDataframe['FASTQ_file']]
@@ -157,15 +199,23 @@ def makeSampleAnnotationTable(infiles, outfile):
 	# Save file
 	mergedDataframe.to_csv(outfile, sep='\t', index=False)	
 
+#######################################################
+#######################################################
+########## S5. Annotation Data
+#######################################################
+#######################################################
+
 #############################################
-########## 2. Transcript expression
+########## 1. Transcript expression
 #############################################
+
+@follows(mkdir('f5-expression_data.dir'))
 
 @merge([makeSampleAnnotationTable,
 		quantifyExpressionData],
-	   'f3-processed_data.dir/ebola_pbmc-transcript_rawcounts.txt')
+	   'f5-expression_data.dir/ebola_pbmc-transcript_rawcounts.txt')
 
-def makeTranscriptRawcountTable(infiles, outfile):
+def getTranscriptRawcounts(infiles, outfile):
 
 	# Split infiles
 	annotationFile = infiles.pop(0)
@@ -189,10 +239,6 @@ def makeTranscriptRawcountTable(infiles, outfile):
 	    # Get sample name
 	    fastqFile = abundanceFile.split('/')[1]
 	    
-	    # Check if annotations are available, otherwise skip#####!!!!!!!!!!!!#######
-	    if fastqFile not in nameConversionDict.keys():
-	        continue
-
 	    # Add sample name
 	    abundanceDataframe['FASTQ_name'] = nameConversionDict[fastqFile]
 
@@ -200,21 +246,21 @@ def makeTranscriptRawcountTable(infiles, outfile):
 	    mergedDataframe = pd.concat([mergedDataframe, abundanceDataframe])
 
 	# Cast dataframe
-	mergedDataframeCast = mergedDataframe.pivot(index='target_id', columns='FASTQ_name', values='est_counts')
+	mergedDataframeCast = mergedDataframe.pivot(index='target_id', columns='FASTQ_name', values='est_counts').astype(int)
 
 	# Write file
-	mergedDataframeCast.to_csv(outfile, sep='\t', index_name='transcript')
+	mergedDataframeCast.to_csv(outfile, sep='\t', index_label='ensembl_transcript_id')
 
 #############################################
-########## 3. Gene expression
+########## 2. Gene expression
 #############################################
 
-@transform('f3-processed_data.dir/ebola_pbmc-transcript_rawcounts.txt',#makeTranscriptRawcountTable,
+@transform('f5-expression_data.dir/ebola_pbmc-transcript_rawcounts.txt',#getTranscriptRawcounts,
 		   suffix('transcript_rawcounts.txt'),
 		   add_inputs(makeTranscriptomeAnnotationTable),
 		   'gene_rawcounts.txt')
 
-def makeGeneRawcountTable(infiles, outfile):
+def getGeneRawcounts(infiles, outfile):
 
 	# Split infiles
 	transcriptInfile, annotationInfile = infiles
@@ -223,13 +269,13 @@ def makeGeneRawcountTable(infiles, outfile):
 	transcriptRawcountDataframe = pd.read_table(transcriptInfile)
 
 	# Get annotation dataframe
-	annotationDataframe = pd.read_table(annotationInfile, usecols=['transcript', 'gene_symbol'])
+	annotationDataframe = pd.read_table(annotationInfile, usecols=['ensembl_transcript_id', 'gene_symbol'])
 
 	# Merge
-	mergedDataframe = transcriptRawcountDataframe.merge(annotationDataframe, on='transcript', how='inner')
+	mergedDataframe = transcriptRawcountDataframe.merge(annotationDataframe, on='ensembl_transcript_id', how='inner')
 
 	# Melt
-	mergedDataframeMelt = pd.melt(mergedDataframe.drop('transcript', axis=1), id_vars='gene_symbol')
+	mergedDataframeMelt = pd.melt(mergedDataframe.drop('ensembl_transcript_id', axis=1), id_vars='gene_symbol')
 
 	# Sum
 	mergedDataframeCombined = mergedDataframeMelt.groupby(['gene_symbol', 'variable']).sum().reset_index()
@@ -242,14 +288,79 @@ def makeGeneRawcountTable(infiles, outfile):
 
 #######################################################
 #######################################################
-########## S. 
+########## S6. Normalize Expression Data
 #######################################################
 #######################################################
 
 #############################################
-########## . 
+########## 1. Run VST
 #############################################
 
+@follows(mkdir('f6-normalized_expression_data.dir'))
+
+@transform(getGeneRawcounts,
+		   regex(r'.*/(.*)rawcounts.txt'),
+		   r'f6-normalized_expression_data.dir/\1vst.txt')
+
+def runVst(infile, outfile):
+
+	# Read expression dataframe
+	expressionDataframe = pd.read_table(infile, index_col='gene_symbol')
+
+	# Run function
+	vstMatrix = r.runVST(com.convert_to_r_dataframe(expressionDataframe))
+
+	# Convert to dataframe
+	vstDataframe = com.convert_robj(vstMatrix)
+
+	# Write file
+	vstDataframe.to_csv(outfile, sep='\t', index_label='gene_symbol')
+
+#######################################################
+#######################################################
+########## S7. Differential Expression Analysis
+#######################################################
+#######################################################
+
+#############################################
+########## 1. Characteristic Direction
+#############################################
+
+@follows(mkdir('f7-differential_expression.dir'))
+
+@transform(runVst,
+		   regex(r'.*/(.*)vst.txt'),
+		   add_inputs(makeSampleAnnotationTable),
+		   r'f7-differential_expression.dir/\1differential_expression.txt')
+
+def runCharacteristicDirection(infiles, outfile):
+
+	# Split infiles
+	vstFile, annotationFile = infiles
+
+	# Read expression data
+	vstDataframe = pd.read_table(vstFile, index_col='gene_symbol')
+
+	# Read annotation data
+	annotationDataframe = pd.read_table(annotationFile, index_col='sample_name')
+
+	# Get gene variance
+	geneVariance = vstDataframe.apply(np.var, 1).sort_values(ascending=False)
+
+	# Get variable genes
+	variableGenes = geneVariance.index[geneVariance > 3].tolist()
+
+	# Filter expression dataframe
+	vstDataframeFiltered = vstDataframe.loc[variableGenes]
+
+	# Get columns
+	experimentColumns = vstDataframeFiltered.columns[:10].tolist()
+	controlColumns = vstDataframeFiltered.columns[10:21].tolist()
+
+	# Run characteristic direction
+	cdResults = r.runCharacteristicDirection(com.convert_to_r_dataframe(vstDataframeFiltered), experimentColumns, controlColumns)
+
+	print cdResults
 
 ##################################################
 ##################################################
