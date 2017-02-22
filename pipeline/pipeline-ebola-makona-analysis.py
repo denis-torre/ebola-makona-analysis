@@ -108,11 +108,11 @@ def makeTranscriptomeAnnotationTable(infile, outfile):
 ########## 1. FastQC
 #############################################
 
-@follows(mkdir('f2-qc.dir'))
+@follows(mkdir('f2-fastqc.dir'))
 
 @transform(sequencingFastq,
 		   regex(r'.*/(.*).fastq.gz'),
-		   r'f2-qc.dir/\1_fastqc.html')
+		   r'f2-fastqc.dir/\1_fastqc.html')
 
 def runFastQC(infile, outfile):
 
@@ -136,12 +136,12 @@ def runFastQC(infile, outfile):
 ########## 1. Quantification
 #############################################
 
-@follows(mkdir('f3-expression_quantification.dir'))
+@follows(mkdir('f3-kallisto2.dir'))
 
 @transform(sequencingFastq,
 		   regex(r'.*/(.*).fastq.gz'),
 		   add_inputs(buildTranscriptomeIndex),
-		   r'f3-expression_quantification.dir/\1')
+		   r'f3-kallisto2.dir/\1')
 
 def quantifyExpressionData(infiles, outfile):
 
@@ -149,7 +149,7 @@ def quantifyExpressionData(infiles, outfile):
 	fastqFile, transcriptomeFile = infiles
 
 	# Prepare statement
-	statement = kallistoPath + ' quant -i %(transcriptomeFile)s -o %(outfile)s -b 100 --single -l 100 -s 20 %(fastqFile)s' % locals()
+	statement = kallistoPath + ' quant -i %(transcriptomeFile)s -o %(outfile)s -b 100 --single -l 200 -s 20 %(fastqFile)s' % locals()
 
 	# Run
 	os.system(statement)
@@ -164,11 +164,11 @@ def quantifyExpressionData(infiles, outfile):
 ########## 1. Sample annotations
 #############################################
 
-@follows(mkdir('f4-annotation_data.dir'))
+@follows(mkdir('f4-annotation.dir'))
 
 @files([sampleAnnotationFile,
 		sampleClinicalDataFile],
-	   'f4-annotation_data.dir/ebola_pbmc-sample_annotations.txt')
+	   'f4-annotation.dir/ebola_pbmc-sample_annotations.txt')
 
 def makeSampleAnnotationTable(infiles, outfile):
 
@@ -209,11 +209,11 @@ def makeSampleAnnotationTable(infiles, outfile):
 ########## 1. Transcript expression
 #############################################
 
-@follows(mkdir('f5-expression_data.dir'))
+@follows(mkdir('f5-rawcounts.dir'))
 
 @merge([makeSampleAnnotationTable,
 		quantifyExpressionData],
-	   'f5-expression_data.dir/ebola_pbmc-transcript_rawcounts.txt')
+	   'f5-rawcounts.dir/ebola_pbmc-transcript_rawcounts.txt')
 
 def getTranscriptRawcounts(infiles, outfile):
 
@@ -255,7 +255,7 @@ def getTranscriptRawcounts(infiles, outfile):
 ########## 2. Gene expression
 #############################################
 
-@transform('f5-expression_data.dir/ebola_pbmc-transcript_rawcounts.txt',#getTranscriptRawcounts,
+@transform('f5-rawcounts.dir/ebola_pbmc-transcript_rawcounts.txt',#getTranscriptRawcounts,
 		   suffix('transcript_rawcounts.txt'),
 		   add_inputs(makeTranscriptomeAnnotationTable),
 		   'gene_rawcounts.txt')
@@ -296,25 +296,69 @@ def getGeneRawcounts(infiles, outfile):
 ########## 1. Run VST
 #############################################
 
-@follows(mkdir('f6-normalized_expression_data.dir'))
+@follows(mkdir('f6-normalized_expression.dir'))
 
 @transform(getGeneRawcounts,
 		   regex(r'.*/(.*)rawcounts.txt'),
-		   r'f6-normalized_expression_data.dir/\1vst.txt')
+		   r'f6-normalized_expression.dir/\1vst.txt')
 
 def runVst(infile, outfile):
 
 	# Read expression dataframe
-	expressionDataframe = pd.read_table(infile, index_col='gene_symbol')
+	rawcountDataframe = pd.read_table(infile, index_col='gene_symbol')
 
 	# Run function
-	vstMatrix = r.runVST(com.convert_to_r_dataframe(expressionDataframe))
+	vstMatrix = r.runVST(com.convert_to_r_dataframe(rawcountDataframe))
 
 	# Convert to dataframe
 	vstDataframe = com.convert_robj(vstMatrix)
 
 	# Write file
 	vstDataframe.to_csv(outfile, sep='\t', index_label='gene_symbol')
+
+#############################################
+########## 2. Run voom
+#############################################
+
+@transform(getGeneRawcounts,
+		   regex(r'.*/(.*)rawcounts.txt'),
+		   r'f6-normalized_expression.dir/\1voom.txt')
+
+def runVoom(infile, outfile):
+
+	# Read expression dataframe
+	rawcountDataframe = pd.read_table(infile, index_col='gene_symbol')
+
+	# Run function
+	voomMatrix = r.runVoom(com.convert_to_r_dataframe(rawcountDataframe))
+
+	# Convert to dataframe
+	voomDataframe = com.convert_robj(voomMatrix)
+
+	# Write file
+	voomDataframe.to_csv(outfile, sep='\t', index_label='gene_symbol')
+
+#############################################
+########## 3. Run size factors
+#############################################
+
+@transform(getGeneRawcounts,
+		   regex(r'.*/(.*)rawcounts.txt'),
+		   r'f6-normalized_expression.dir/\1sizefactors.txt')
+
+def runSizeFactorNormalization(infile, outfile):
+
+	# Read expression dataframe
+	rawcountDataframe = pd.read_table(infile, index_col='gene_symbol')
+
+	# Run function
+	normalizedCountMatrix = r.runSizeFactorNormalization(com.convert_to_r_dataframe(rawcountDataframe))
+
+	# Convert to dataframe
+	normalizedCountDataframe = com.convert_robj(normalizedCountMatrix)
+
+	# Write file
+	normalizedCountDataframe.to_csv(outfile, sep='\t', index_label='gene_symbol')
 
 #######################################################
 #######################################################
@@ -326,12 +370,14 @@ def runVst(infile, outfile):
 ########## 1. Characteristic Direction
 #############################################
 
-@follows(mkdir('f7-differential_expression.dir'))
+@follows(mkdir('f7-differential_expression.dir/cd'))
 
-@transform(runVst,
-		   regex(r'.*/(.*)vst.txt'),
+@transform([runVst,
+			runVoom,
+			runSizeFactorNormalization],
+		   regex(r'.*/(.*).txt'),
 		   add_inputs(makeSampleAnnotationTable),
-		   r'f7-differential_expression.dir/\1differential_expression.txt')
+		   r'f7-differential_expression.dir/cd/\1_differential_expression.txt')
 
 def runCharacteristicDirection(infiles, outfile):
 
@@ -344,23 +390,165 @@ def runCharacteristicDirection(infiles, outfile):
 	# Read annotation data
 	annotationDataframe = pd.read_table(annotationFile, index_col='sample_name')
 
-	# Get gene variance
-	geneVariance = vstDataframe.apply(np.var, 1).sort_values(ascending=False)
+	# Get timepoint samples
+	timepointSampleDict = {'day'+str(day): annotationDataframe.index[annotationDataframe['day']==day].tolist() for day in set(annotationDataframe['day'])}
 
-	# Get variable genes
-	variableGenes = geneVariance.index[geneVariance > 3].tolist()
+	# Group 4 and 5 days
+	timepointSampleDict['day4-5'] = timepointSampleDict['day4'] + timepointSampleDict['day5']
+	del timepointSampleDict['day4']
+	del timepointSampleDict['day5']
 
-	# Filter expression dataframe
-	vstDataframeFiltered = vstDataframe.loc[variableGenes]
+	# Get controls
+	controlColumns = timepointSampleDict.pop('day0')
 
-	# Get columns
-	experimentColumns = vstDataframeFiltered.columns[:10].tolist()
-	controlColumns = vstDataframeFiltered.columns[10:21].tolist()
+	# Initialize empty dataframe
+	resultDataframe = pd.DataFrame()
 
-	# Run characteristic direction
-	cdResults = r.runCharacteristicDirection(com.convert_to_r_dataframe(vstDataframeFiltered), experimentColumns, controlColumns)
+	# Loop through timepoints
+	for timepoint in timepointSampleDict.keys():
+		    
+		# Get experiment samples
+		experimentColumns = timepointSampleDict[timepoint]
 
-	print cdResults
+		# Run characteristic direction
+		cdResults = r.runCharacteristicDirection(com.convert_to_r_dataframe(vstDataframe), experimentColumns, controlColumns, 0.1)
+
+		# Convert to dataframe
+		cdDataframe = com.convert_robj(cdResults).reset_index()
+
+		# Add timepoint column
+		cdDataframe['timepoint'] = timepoint
+
+		# Append
+		resultDataframe = pd.concat([resultDataframe, cdDataframe])
+
+	# Pivot
+	resultDataframeCast = resultDataframe.pivot(index='index', columns='timepoint', values='CD')
+
+	# Save
+	resultDataframeCast.to_csv(outfile, sep='\t', index_label='gene_symbol')
+
+#######################################################
+#######################################################
+########## S8. Enrichment Analysis
+#######################################################
+#######################################################
+
+#############################################
+########## 1. Submit Genesets 
+#############################################
+
+@follows(mkdir('f8-enrichr.dir'))
+
+@transform(runCharacteristicDirection,
+		   regex(r'.*/(.*)differential_expression.txt'),
+		   r'f8-enrichr.dir/\1enrichr_links.txt')
+
+def submitEnrichrGenesets(infile, outfile):
+
+	# Read infile
+	cdDataframe = pd.read_table(infile, index_col='gene_symbol').fillna(0)
+
+	# Initialize link dataframe
+	resultDataframe = pd.DataFrame()
+
+	# Loop through timepoints
+	for timepoint in cdDataframe.columns:
+
+	    # Get Enrichr links
+	    enrichrLinkDataframe = S.uploadToEnrichr(cdDataframe, timepoint)
+
+	    # Add timepoint label
+	    enrichrLinkDataframe['timepoint'] = timepoint
+
+	    # Concatenate
+	    resultDataframe = pd.concat([resultDataframe, enrichrLinkDataframe])
+
+	# Save data
+	resultDataframe.to_csv(outfile, sep='\t', index=False)
+
+#############################################
+########## 2. Get Enrichment results
+#############################################
+
+@transform(submitEnrichrGenesets,
+		   regex(r'.*/(.*)links.txt'),
+		   r'f8-enrichr.dir/\1results.txt')
+
+def getEnrichrResults(infile, outfile):
+
+	# Read infile
+	enrichrLinkDataframe = pd.read_table(infile, index_col=['geneset','timepoint'])
+
+	# Initialize result dataframe
+	resultDataframe = pd.DataFrame()
+
+	# Set libraries
+	libraries = ['ChEA_2016', 'KEGG_2016', 'GO_Biological_Process_2015', 'GO_Cellular_Component_2015', 'GO_Molecular_Function_2015', 'VirusMINT']
+
+	# Loop through timepoints, genesets and libraries
+	for geneset in enrichrLinkDataframe.index.levels[0]:
+	    for timepoint in enrichrLinkDataframe.index.levels[1]:
+	        for library in libraries:
+
+	            # Get enrichment results
+	            enrichmentResultDataframe = S.getEnrichmentResults(enrichrLinkDataframe.loc[(geneset, timepoint), 'userListId'], library)
+
+	            # Add labels
+	            enrichmentResultDataframe['timepoint'] = timepoint
+	            enrichmentResultDataframe['geneset'] = geneset
+	            enrichmentResultDataframe['library'] = library
+
+	            # Concatenate
+	            resultDataframe = pd.concat([resultDataframe, enrichmentResultDataframe])
+
+    # Write file
+	resultDataframe.to_csv(outfile, sep='\t', index=False)
+
+#######################################################
+#######################################################
+########## S9. L1000CDS2 Analysis
+#######################################################
+#######################################################
+
+#############################################
+########## 1. Submit analysis
+#############################################
+
+@follows(mkdir('f9-l1000cds2.dir'))
+
+@transform(runCharacteristicDirection,
+		   regex(r'.*/(.*)differential_expression.txt'),
+		   r'f9-l1000cds2.dir/\1l1000cds2_links.txt')
+
+def runL1000CDS2(infile, outfile):
+
+	# Read infile
+	cdDataframe = pd.read_table(infile, index_col='gene_symbol').fillna(0)
+
+	# Initialize dataframes
+	linkDataframe = pd.DataFrame()
+	signatureDataframe = pd.DataFrame()
+
+	# Loop through timepoints
+	for timepoint in cdDataframe.columns:
+
+	    # Run L1000CDS2
+	    resultDict = S.getL1000CDS2Results(cdDataframe, timepoint)
+
+	    # Add timepoint labels
+	    resultDict['links']['timepoint'] = timepoint
+	    resultDict['signatures']['timepoint'] = timepoint
+
+	    # Append dataframes
+	    linkDataframe = pd.concat([linkDataframe, resultDict['links']])
+	    signatureDataframe = pd.concat([signatureDataframe, resultDict['signatures']])
+
+	# Write files
+	linkDataframe.to_csv(outfile, sep='\t', index=False)
+	signatureDataframe.to_csv(outfile.replace('links', 'signatures'), sep='\t', index=False)
+
+
 
 ##################################################
 ##################################################
